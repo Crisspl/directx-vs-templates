@@ -6,6 +6,8 @@
 
 #include "StepTimer.h"
 
+#include <DescriptorHeap.h>
+#include <GraphicsMemory.h>
 
 // A basic game implementation that creates a D3D12 device and
 // provides a game loop.
@@ -40,6 +42,14 @@ public:
 
 private:
 
+    enum DescHeapIx : size_t
+    {
+        // insert more enum entries BEFORE this one
+        DescIx_MeshResourcesStart = 0,
+        DescIx_MeshIndexBufSRV = DescIx_MeshResourcesStart,
+        DescIx_MeshVertexBufSRV = DescIx_MeshIndexBufSRV + 1
+    };
+
     void Update(DX::StepTimer const& timer);
     void Render();
 
@@ -65,13 +75,13 @@ private:
     static const UINT                                   c_swapBufferCount = 2;
     UINT                                                m_backBufferIndex;
     UINT                                                m_rtvDescriptorSize;
-    Microsoft::WRL::ComPtr<ID3D12Device>                m_d3dDevice;
+    Microsoft::WRL::ComPtr<ID3D12Device5>               m_d3dDevice;
     Microsoft::WRL::ComPtr<IDXGIFactory4>               m_dxgiFactory;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue>          m_commandQueue;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        m_rtvDescriptorHeap;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>        m_dsvDescriptorHeap;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator>      m_commandAllocators[c_swapBufferCount];
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>   m_commandList;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList6>  m_commandList;
     Microsoft::WRL::ComPtr<ID3D12Fence>                 m_fence;
     UINT64                                              m_fenceValues[c_swapBufferCount];
     Microsoft::WRL::Wrappers::Event                     m_fenceEvent;
@@ -81,9 +91,13 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource>              m_renderTargets[c_swapBufferCount];
     Microsoft::WRL::ComPtr<ID3D12Resource>              m_depthStencil;
 
+    // D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV heap
+    constexpr static UINT CBV_SRV_UAV_DESC_MAX_COUNT = 128U;
+    std::unique_ptr<DirectX::DescriptorHeap>            m_descHeap;
+
     // Game state
     DX::StepTimer                                       m_timer;
 
     // If using the DirectX Tool Kit for DX12, uncomment this line:
-    // std::unique_ptr<DirectX::GraphicsMemory> m_graphicsMemory;
+    std::unique_ptr<DirectX::GraphicsMemory> m_graphicsMemory;
 };

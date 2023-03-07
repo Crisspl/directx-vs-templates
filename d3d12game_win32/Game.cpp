@@ -5,6 +5,9 @@
 #include "pch.h"
 #include "Game.h"
 
+#include <Model.h>
+#include <ResourceUploadBatch.h>
+
 extern void ExitGame() noexcept;
 
 using namespace DirectX;
@@ -28,6 +31,17 @@ Game::~Game()
     WaitForGpu();
 }
 
+static ComPtr<ID3D12Resource> AllocGpuBuf(ID3D12Device* dev, UINT64 sz, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON)
+{
+    ComPtr<ID3D12Resource> buf;
+    auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    auto bufDesc = CD3DX12_RESOURCE_DESC::Buffer(sz, flags);
+
+    dev->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc, state, nullptr, IID_PPV_ARGS(buf.ReleaseAndGetAddressOf()));
+
+    return buf;
+}
+
 // Initialize the Direct3D resources required to run.
 void Game::Initialize(HWND window, int width, int height)
 {
@@ -44,6 +58,107 @@ void Game::Initialize(HWND window, int width, int height)
     m_timer.SetFixedTimeStep(true);
     m_timer.SetTargetElapsedSeconds(1.0 / 60);
     */
+
+    auto* dev = m_d3dDevice.Get();
+
+    std::unique_ptr<DirectX::Model> sdkmesh = DirectX::Model::CreateFromSDKMESH(dev, L"dragon_LOD0.sdkmesh");
+
+    // create gpu resources for mesh data
+    {
+        DirectX::ResourceUploadBatch upload(dev);
+
+        upload.Begin();
+        sdkmesh->LoadStaticBuffers(dev, upload);
+        upload.End(m_commandQueue.Get()).wait();
+    }
+
+    // only care about 1st mesh
+    auto* mesh0 = sdkmesh->meshes[0]->opaqueMeshParts[0].get();
+
+    auto* vtxbuf = mesh0->staticVertexBuffer.Get();
+    auto* idxbuf = mesh0->staticIndexBuffer.Get();
+
+    const auto& vtxDecl_pos = (*mesh0->vbDecl)[0];
+    const UINT vtxOffset_pos = vtxDecl_pos.AlignedByteOffset == 0xffffffffU ? 0U : vtxDecl_pos.AlignedByteOffset;
+
+    assert(strcmp("SV_Position", vtxDecl_pos.SemanticName) == 0);
+    assert(vtxDecl_pos.Format == DXGI_FORMAT_R32G32B32_FLOAT);
+    assert(vtxOffset_pos == 0U);
+
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+        // index buf
+        srvDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+        srvDesc.Buffer.FirstElement = mesh0->startIndex;
+        srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        srvDesc.Buffer.NumElements = mesh0->indexCount;
+        dev->CreateShaderResourceView(idxbuf, &srvDesc, m_descHeap->GetCpuHandle(DescIx_MeshIndexBufSRV));
+
+        // vertex buf
+        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+        srvDesc.Buffer.FirstElement = mesh0->vertexOffset;
+        srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        srvDesc.Buffer.StructureByteStride = mesh0->vertexStride;
+        srvDesc.Buffer.NumElements = mesh0->vertexCount;
+        dev->CreateShaderResourceView(vtxbuf, &srvDesc, m_descHeap->GetCpuHandle(DescIx_MeshVertexBufSRV));
+    }
+
+    // Create BLAS
+    ComPtr<ID3D12Resource> blas;
+    UINT64 blasSz = 0ULL;
+    UINT64 blasCreateScratchSz = 0ULL;
+
+    {
+        constexpr auto BuildFlags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+
+        D3D12_RAYTRACING_GEOMETRY_DESC geomDesc = {};
+        geomDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        geomDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        geomDesc.Triangles.IndexBuffer = idxbuf->GetGPUVirtualAddress() + mesh0->startIndex * sizeof(uint32_t);
+        geomDesc.Triangles.IndexCount = mesh0->indexCount;
+        geomDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+        geomDesc.Triangles.Transform3x4 = 0;
+        geomDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        geomDesc.Triangles.VertexCount = mesh0->vertexCount;
+        geomDesc.Triangles.VertexBuffer.StartAddress = vtxbuf->GetGPUVirtualAddress() + (mesh0->vertexOffset * mesh0->vertexStride) + vtxOffset_pos;
+        geomDesc.Triangles.VertexBuffer.StrideInBytes = mesh0->vertexStride;
+
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blasBuildDesc = {};
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS& blasInputs = blasBuildDesc.Inputs;
+
+        blasInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        blasInputs.Flags = BuildFlags;
+        blasInputs.NumDescs = 1U;
+        blasInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+        blasInputs.pGeometryDescs = &geomDesc;
+
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blasPrebuildInfo = {};
+        dev->GetRaytracingAccelerationStructurePrebuildInfo(&blasInputs, &blasPrebuildInfo);
+        assert(blasPrebuildInfo.ResultDataMaxSizeInBytes > 0 && "wtf");
+
+        blasCreateScratchSz = blasPrebuildInfo.ScratchDataSizeInBytes;
+        auto scratchBuf = AllocGpuBuf(dev, blasCreateScratchSz, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        blas = AllocGpuBuf(dev, blasPrebuildInfo.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+
+        blasBuildDesc.ScratchAccelerationStructureData = scratchBuf->GetGPUVirtualAddress();
+        blasBuildDesc.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
+
+        // submit build
+        m_commandList->Reset(m_commandAllocators[m_backBufferIndex].Get(), nullptr);
+
+        m_commandList->BuildRaytracingAccelerationStructure(&blasBuildDesc, 0U, nullptr);
+        m_commandList->Close();
+
+        m_commandQueue->ExecuteCommandLists(1, CommandListCast(m_commandList.GetAddressOf()));
+
+        // wait for BLAS to be finished
+        WaitForGpu();
+    }
 }
 
 // Executes the basic game loop.
@@ -282,6 +397,8 @@ void Game::CreateDevice()
     DX::ThrowIfFailed(m_d3dDevice->CreateDescriptorHeap(&rtvDescriptorHeapDesc, IID_PPV_ARGS(m_rtvDescriptorHeap.ReleaseAndGetAddressOf())));
     DX::ThrowIfFailed(m_d3dDevice->CreateDescriptorHeap(&dsvDescriptorHeapDesc, IID_PPV_ARGS(m_dsvDescriptorHeap.ReleaseAndGetAddressOf())));
 
+    m_descHeap = std::make_unique<DirectX::DescriptorHeap>(m_d3dDevice.Get(), CBV_SRV_UAV_DESC_MAX_COUNT);
+
     m_rtvDescriptorSize = m_d3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     // Create a command allocator for each back buffer that will be rendered to.
@@ -316,7 +433,7 @@ void Game::CreateDevice()
     }
 
     // If using the DirectX Tool Kit for DX12, uncomment this line:
-    // m_graphicsMemory = std::make_unique<GraphicsMemory>(m_d3dDevice.Get());
+    m_graphicsMemory = std::make_unique<GraphicsMemory>(m_d3dDevice.Get());
 
     // TODO: Initialize device dependent objects here (independent of window size).
 }
